@@ -41,7 +41,6 @@ function createSession(data) {
   sessionCache.set(id, { ...data, createdAt: Date.now() });
   for (const [k, v] of sessionCache) {
     if (Date.now() - v.createdAt > SESSION_TTL) {
-      if (v.browser) v.browser.close().catch(() => {});
       sessionCache.delete(k);
     }
   }
@@ -150,24 +149,23 @@ function fetchWithCookies(url, referer, cookies) {
   });
 }
 
-async function fetchViaBrowser(browser, url, referer) {
-  const page = await browser.newPage();
-  try {
-    const ref = (referer || new URL(url).origin + "/").replace(/\/?$/, "/");
-    await page.setExtraHTTPHeaders({
-      Referer: ref,
-      Origin: ref.replace(/\/$/, ""),
-    });
-    const res = await page.goto(url, { waitUntil: "load", timeout: 20000 });
-    if (!res || res.status() !== 200) {
-      throw new Error(res ? `HTTP ${res.status()}` : "No response");
+async function fetchViaPage(page, url) {
+  if (!page || (typeof page.isClosed === "function" && page.isClosed())) throw new Error("Page closed");
+  const frames = page.frames();
+  for (const frame of frames) {
+    try {
+      const arr = await frame.evaluate(async (u) => {
+        const r = await fetch(u, { credentials: "include", mode: "cors" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const ab = await r.arrayBuffer();
+        return Array.from(new Uint8Array(ab));
+      }, url);
+      return { body: Buffer.from(arr), contentType: "video/mp2t" };
+    } catch (e) {
+      continue;
     }
-    const body = await res.buffer();
-    const contentType = res.headers()["content-type"] || "";
-    return { body, contentType };
-  } finally {
-    await page.close().catch(() => {});
   }
+  throw new Error("All frames failed");
 }
 
 function encodeProxyPayload(sessionId, url) {
@@ -245,12 +243,16 @@ async function handleHlsProxy(req, res, pathname) {
       contentType = r.contentType;
       console.log(`[hls] OK via HTTP, ${body.length} bytes`);
     } catch (httpErr) {
-      console.log(`[hls] HTTP failed (${httpErr.message}), trying browser...`);
-      if (session.browser && session.browser.connected) {
-        const r = await fetchViaBrowser(session.browser, url, session.referer);
-        body = r.body;
-        contentType = r.contentType;
-        console.log(`[hls] OK via browser, ${body.length} bytes`);
+      console.log(`[hls] HTTP failed (${httpErr.message}), trying page fetch...`);
+      if (session.videoPage && typeof session.videoPage.isClosed === "function" && !session.videoPage.isClosed()) {
+        try {
+          const r = await fetchViaPage(session.videoPage, url);
+          body = r.body;
+          contentType = r.contentType;
+          console.log(`[hls] OK via page fetch, ${body.length} bytes`);
+        } catch (e) {
+          throw httpErr;
+        }
       } else {
         throw httpErr;
       }
@@ -403,6 +405,7 @@ async function resolveStream(tmdbId) {
   console.log(`[proxy] Final cookies: ${cookieStr.length} chars`);
 
   const baseUrl = global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com";
+  const videoPage = lastPage;
   const streams = [];
   for (const r of m3u8Found) {
     const m3u8Bodies = {};
@@ -411,7 +414,7 @@ async function resolveStream(tmdbId) {
     const sessionId = createSession({
       referer: r.referer,
       cookies: cookieStr,
-      browser: browser,
+      videoPage: videoPage,
       m3u8Bodies,
     });
     console.log(`[proxy] Session ${sessionId} created`);
