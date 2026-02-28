@@ -280,6 +280,7 @@ async function handleHlsProxy(req, res, pathname) {
 async function resolveStream(tmdbId) {
   const browser = await puppeteer.launch(PUPPETEER_LAUNCH_OPTIONS);
   const m3u8Found = [];
+  const bodyPromises = [];
   let foundResolve;
   const foundPromise = new Promise((r) => { foundResolve = r; });
 
@@ -290,7 +291,9 @@ async function resolveStream(tmdbId) {
     const { clean, referer } = parseM3u8Params(u);
     const idx = m3u8Found.length;
     m3u8Found.push({ url: clean, referer, body: null });
-    res.text().then((t) => { m3u8Found[idx].body = t; }).catch(() => {});
+    bodyPromises.push(
+      res.buffer().then((b) => { m3u8Found[idx].body = b.toString("utf8"); }).catch((e) => { console.log(`[proxy] Body read failed: ${e.message}`); })
+    );
     foundResolve();
   }
 
@@ -303,7 +306,7 @@ async function resolveStream(tmdbId) {
       await page.setRequestInterception(true);
       page.on("request", (req) => {
         const t = req.resourceType();
-        if (["image", "stylesheet", "font", "media"].includes(t)) req.abort();
+        if (["image", "stylesheet", "font"].includes(t)) req.abort();
         else req.continue();
       });
       page.on("response", onM3u8);
@@ -321,9 +324,6 @@ async function resolveStream(tmdbId) {
         // Get ALL cookies via CDP
         const cookieStr = await getAllCookies(page);
         console.log(`[proxy] Cookies: ${cookieStr.length} chars`);
-
-        // Wait for body promises to settle
-        await new Promise((r) => setTimeout(r, 1000));
 
         for (const m of m3u8Found) {
           console.log(`[proxy] Stream: ${m.url.substring(0, 50)}... body=${m.body ? m.body.length : "null"}`);
@@ -366,7 +366,7 @@ async function resolveStream(tmdbId) {
           await p2.setRequestInterception(true);
           p2.on("request", (req) => {
             const t = req.resourceType();
-            if (["image", "stylesheet", "font", "media"].includes(t)) req.abort();
+            if (["image", "stylesheet", "font"].includes(t)) req.abort();
             else req.continue();
           });
           p2.on("response", onM3u8);
@@ -391,6 +391,10 @@ async function resolveStream(tmdbId) {
     await browser.close();
     return [];
   }
+
+  // Wait for ALL m3u8 body reads (main page + iframe)
+  await Promise.allSettled(bodyPromises);
+  await new Promise((r) => setTimeout(r, 500));
 
   // Get cookies from last active page
   const pages = await browser.pages();
