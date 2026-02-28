@@ -64,6 +64,33 @@ function parseM3u8Params(fullUrl) {
   return { clean, referer };
 }
 
+function getVariantM3u8Urls(m3u8Body, baseUrl) {
+  if (!m3u8Body || !baseUrl) return [];
+  const baseDir = baseUrl.replace(/\?.*$/, "").replace(/\/[^/]*$/, "/");
+  const urls = [];
+  const lines = m3u8Body.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith("#EXT-X-STREAM-INF")) {
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      let path = uriMatch ? uriMatch[1] : (lines[i + 1] && lines[i + 1].trim());
+      if (path && path.endsWith(".m3u8") && !path.startsWith("#")) {
+        const full = path.startsWith("http") ? path : new URL(path, baseDir).href;
+        urls.push(full);
+      }
+    }
+  }
+  return urls;
+}
+
+async function fetchUrlInPage(page, url) {
+  return page.evaluate(async (u) => {
+    const r = await fetch(u);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.text();
+  }, url);
+}
+
 async function getAllCookies(page) {
   try {
     const client = await page.target().createCDPSession();
@@ -198,11 +225,12 @@ async function handleHlsProxy(req, res, pathname) {
   const proxyBase = getBaseUrl(req);
 
   try {
-    // m3u8 from cache
-    if (ext === "m3u8" && session.m3u8Bodies && session.m3u8Bodies[url]) {
+    // m3u8 from cache (try exact url and normalized path)
+    const cachedBody = session.m3u8Bodies && (session.m3u8Bodies[url] || session.m3u8Bodies[url.replace(/%2F/g, "/")]);
+    if (ext === "m3u8" && cachedBody) {
       console.log(`[hls] Serving m3u8 from cache for ${url.substring(0, 50)}...`);
       const baseUrl = url.includes("?") ? url.substring(0, url.indexOf("?")) : url;
-      const rewritten = rewriteM3u8(session.m3u8Bodies[url], baseUrl, proxyBase, sessionId);
+      const rewritten = rewriteM3u8(cachedBody, baseUrl, proxyBase, sessionId);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.writeHead(200);
       return res.end(rewritten);
@@ -301,6 +329,25 @@ async function resolveStream(tmdbId) {
           console.log(`[proxy] Stream: ${m.url.substring(0, 50)}... body=${m.body ? m.body.length : "null"}`);
         }
 
+        // Pre-fetch variant m3u8 (e.g. 1080p) in same page context so we have it in cache
+        for (const m of m3u8Found) {
+          if (!m.body) continue;
+          const baseUrl = m.url.replace(/\?.*$/, "");
+          const variants = getVariantM3u8Urls(m.body, baseUrl);
+          for (const variantUrl of variants) {
+            try {
+              console.log(`[proxy] Pre-fetching variant: ${variantUrl.substring(0, 60)}...`);
+              const body = await fetchUrlInPage(page, variantUrl);
+              m.variantBodies = m.variantBodies || {};
+              m.variantBodies[variantUrl] = body;
+              m.variantBodies[variantUrl.replace(/%2F/g, "/")] = body;
+              console.log(`[proxy] Cached variant, ${body.length} chars`);
+            } catch (e) {
+              console.log(`[proxy] Variant fetch failed: ${e.message}`);
+            }
+          }
+        }
+
         // Don't close page - keep browser alive for .ts fetching
         break;
       }
@@ -354,11 +401,14 @@ async function resolveStream(tmdbId) {
   const baseUrl = global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com";
   const streams = [];
   for (const r of m3u8Found) {
+    const m3u8Bodies = {};
+    if (r.body) m3u8Bodies[r.url] = r.body;
+    if (r.variantBodies) Object.assign(m3u8Bodies, r.variantBodies);
     const sessionId = createSession({
       referer: r.referer,
       cookies: cookieStr,
       browser: browser,
-      m3u8Bodies: r.body ? { [r.url]: r.body } : {},
+      m3u8Bodies,
     });
     console.log(`[proxy] Session ${sessionId} created`);
     streams.push({
