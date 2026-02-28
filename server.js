@@ -33,50 +33,85 @@ const PUPPETEER_LAUNCH_OPTIONS = {
   ],
 };
 
-// Session cache: stores m3u8 bodies, cookies, and referer per session
 const sessionCache = new Map();
-const SESSION_TTL = 30 * 60 * 1000; // 30 min
+const SESSION_TTL = 15 * 60 * 1000;
 
 function createSession(data) {
   const id = crypto.randomBytes(8).toString("hex");
   sessionCache.set(id, { ...data, createdAt: Date.now() });
-  // Cleanup old sessions
   for (const [k, v] of sessionCache) {
-    if (Date.now() - v.createdAt > SESSION_TTL) sessionCache.delete(k);
+    if (Date.now() - v.createdAt > SESSION_TTL) {
+      if (v.browser) v.browser.close().catch(() => {});
+      sessionCache.delete(k);
+    }
   }
   return id;
+}
+
+function parseM3u8Params(fullUrl) {
+  let clean = fullUrl.split("?")[0];
+  let referer = "https://videostr.net/";
+  try {
+    const qs = fullUrl.indexOf("?") >= 0 ? fullUrl.substring(fullUrl.indexOf("?") + 1) : "";
+    const params = new URLSearchParams(qs);
+    const hdr = params.get("headers");
+    if (hdr) {
+      const o = JSON.parse(decodeURIComponent(hdr));
+      if (o.referer) referer = o.referer;
+      if (o.origin) referer = o.origin;
+    }
+  } catch (e) {}
+  return { clean, referer };
+}
+
+async function getAllCookies(page) {
+  try {
+    const client = await page.target().createCDPSession();
+    const { cookies } = await client.send("Network.getAllCookies");
+    await client.detach();
+    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  } catch (e) {
+    console.log(`[proxy] CDP cookie error: ${e.message}`);
+    try {
+      const cookies = await page.cookies();
+      return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    } catch (e2) {
+      return "";
+    }
+  }
 }
 
 function fetchWithCookies(url, referer, cookies) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : require("http");
-    const pathRaw = decodeURIComponent(u.pathname) + (u.search || "");
+    const pathDecoded = decodeURIComponent(u.pathname) + (u.search || "");
     const options = {
       hostname: u.hostname,
       port: u.port || (u.protocol === "https:" ? 443 : 80),
-      path: pathRaw,
+      path: pathDecoded,
       method: "GET",
       headers: {
         Referer: referer || u.origin + "/",
         Origin: (referer || u.origin + "/").replace(/\/$/, ""),
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "cross-site",
+        "Sec-Ch-Ua": '"Chromium";v="120", "Not_A Brand";v="8"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
       },
     };
     if (cookies) options.headers.Cookie = cookies;
-    console.log(`[hls] GET ${u.hostname}${pathRaw.substring(0, 50)}... ${cookies ? "(with cookies)" : ""}`);
     const req = lib.get(options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const next = new URL(res.headers.location, url).href;
-        console.log(`[hls] Redirect -> ${next.substring(0, 60)}...`);
         return fetchWithCookies(next, referer, cookies).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
-        console.log(`[hls] Status ${res.statusCode}`);
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
       const chunks = [];
@@ -86,6 +121,26 @@ function fetchWithCookies(url, referer, cookies) {
     req.on("error", reject);
     req.setTimeout(20000, () => { req.destroy(); reject(new Error("Timeout")); });
   });
+}
+
+async function fetchViaBrowser(browser, url, referer) {
+  const page = await browser.newPage();
+  try {
+    const ref = (referer || new URL(url).origin + "/").replace(/\/?$/, "/");
+    await page.setExtraHTTPHeaders({
+      Referer: ref,
+      Origin: ref.replace(/\/$/, ""),
+    });
+    const res = await page.goto(url, { waitUntil: "load", timeout: 20000 });
+    if (!res || res.status() !== 200) {
+      throw new Error(res ? `HTTP ${res.status()}` : "No response");
+    }
+    const body = await res.buffer();
+    const contentType = res.headers()["content-type"] || "";
+    return { body, contentType };
+  } finally {
+    await page.close().catch(() => {});
+  }
 }
 
 function encodeProxyPayload(sessionId, url) {
@@ -99,91 +154,91 @@ function decodeProxyPayload(encoded) {
     const payload = Buffer.from(padded, "base64").toString("utf8");
     const idx = payload.indexOf("|");
     if (idx < 0) return null;
-    return {
-      sessionId: payload.substring(0, idx),
-      url: payload.substring(idx + 1),
-    };
+    return { sessionId: payload.substring(0, idx), url: payload.substring(idx + 1) };
   } catch (e) {
     return null;
   }
 }
 
+function rewriteM3u8(text, baseUrl, proxyBase, sessionId) {
+  const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
+  const lines = text.split("\n");
+  const out = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      out.push(rawLine);
+      continue;
+    }
+    let segUrl = line;
+    if (!segUrl.startsWith("http")) segUrl = new URL(segUrl, baseDir).href;
+    const segExt = segUrl.includes(".m3u8") ? "m3u8" : "ts";
+    out.push(`${proxyBase}/hls/${encodeProxyPayload(sessionId, segUrl)}.${segExt}`);
+  }
+  return out.join("\n");
+}
+
 async function handleHlsProxy(req, res, pathname) {
   const match = pathname.match(/^\/hls\/([A-Za-z0-9_-]+)(\.(m3u8|ts))?$/);
-  if (!match) {
-    res.writeHead(404);
-    return res.end();
-  }
+  if (!match) { res.writeHead(404); return res.end(); }
+
   const encoded = match[1];
   const ext = match[3] || "m3u8";
   const decoded = decodeProxyPayload(encoded);
-  if (!decoded) {
-    res.writeHead(400);
-    return res.end("Invalid");
-  }
+  if (!decoded) { res.writeHead(400); return res.end("Invalid"); }
+
   const { sessionId, url } = decoded;
   const session = sessionCache.get(sessionId);
   if (!session) {
-    console.log(`[hls] Session ${sessionId} not found`);
+    console.log(`[hls] Session ${sessionId} expired`);
     res.writeHead(410);
     return res.end("Session expired");
   }
 
+  const proxyBase = getBaseUrl(req);
+
   try {
+    // m3u8 from cache
     if (ext === "m3u8" && session.m3u8Bodies && session.m3u8Bodies[url]) {
-      console.log(`[hls] Serving m3u8 from cache`);
-      const text = session.m3u8Bodies[url];
+      console.log(`[hls] Serving m3u8 from cache for ${url.substring(0, 50)}...`);
       const baseUrl = url.includes("?") ? url.substring(0, url.indexOf("?")) : url;
-      const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
-      const proxyBase = getBaseUrl(req);
-      const lines = text.split("\n");
-      const out = [];
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith("#")) {
-          out.push(rawLine);
-          continue;
-        }
-        let segUrl = line;
-        if (!segUrl.startsWith("http")) segUrl = new URL(segUrl, baseDir).href;
-        const segExt = segUrl.includes(".m3u8") ? "m3u8" : "ts";
-        out.push(`${proxyBase}/hls/${encodeProxyPayload(sessionId, segUrl)}.${segExt}`);
-      }
+      const rewritten = rewriteM3u8(session.m3u8Bodies[url], baseUrl, proxyBase, sessionId);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.writeHead(200);
-      return res.end(out.join("\n"));
+      return res.end(rewritten);
     }
 
+    // Try Node.js HTTP with cookies first
     console.log(`[hls] Fetching ${ext}: ${url.substring(0, 60)}...`);
-    const { body, contentType } = await fetchWithCookies(url, session.referer, session.cookies);
+    let body, contentType;
+    try {
+      const r = await fetchWithCookies(url, session.referer, session.cookies);
+      body = r.body;
+      contentType = r.contentType;
+      console.log(`[hls] OK via HTTP, ${body.length} bytes`);
+    } catch (httpErr) {
+      console.log(`[hls] HTTP failed (${httpErr.message}), trying browser...`);
+      if (session.browser && session.browser.connected) {
+        const r = await fetchViaBrowser(session.browser, url, session.referer);
+        body = r.body;
+        contentType = r.contentType;
+        console.log(`[hls] OK via browser, ${body.length} bytes`);
+      } else {
+        throw httpErr;
+      }
+    }
 
     if (ext === "m3u8") {
       const text = body.toString("utf8");
       if (!session.m3u8Bodies) session.m3u8Bodies = {};
       session.m3u8Bodies[url] = text;
       const baseUrl = url.includes("?") ? url.substring(0, url.indexOf("?")) : url;
-      const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
-      const proxyBase = getBaseUrl(req);
-      const lines = text.split("\n");
-      const out = [];
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith("#")) {
-          out.push(rawLine);
-          continue;
-        }
-        let segUrl = line;
-        if (!segUrl.startsWith("http")) segUrl = new URL(segUrl, baseDir).href;
-        const segExt = segUrl.includes(".m3u8") ? "m3u8" : "ts";
-        out.push(`${proxyBase}/hls/${encodeProxyPayload(sessionId, segUrl)}.${segExt}`);
-      }
-      console.log(`[hls] OK m3u8, ${out.length} lines`);
+      const rewritten = rewriteM3u8(text, baseUrl, proxyBase, sessionId);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.writeHead(200);
-      return res.end(out.join("\n"));
+      return res.end(rewritten);
     }
 
-    console.log(`[hls] OK ${ext}, ${body.length} bytes`);
     res.setHeader("Content-Type", contentType || "video/mp2t");
     res.writeHead(200);
     return res.end(body);
@@ -196,7 +251,20 @@ async function handleHlsProxy(req, res, pathname) {
 
 async function resolveStream(tmdbId) {
   const browser = await puppeteer.launch(PUPPETEER_LAUNCH_OPTIONS);
-  const results = [];
+  const m3u8Found = [];
+  let foundResolve;
+  const foundPromise = new Promise((r) => { foundResolve = r; });
+
+  function onM3u8(res) {
+    const u = res.url();
+    if (!u.includes(".m3u8")) return;
+    console.log(`[proxy] Found HLS: ${u}`);
+    const { clean, referer } = parseM3u8Params(u);
+    const idx = m3u8Found.length;
+    m3u8Found.push({ url: clean, referer, body: null });
+    res.text().then((t) => { m3u8Found[idx].body = t; }).catch(() => {});
+    foundResolve();
+  }
 
   for (const buildUrl of SOURCES) {
     const url = buildUrl(tmdbId);
@@ -210,49 +278,34 @@ async function resolveStream(tmdbId) {
         if (["image", "stylesheet", "font", "media"].includes(t)) req.abort();
         else req.continue();
       });
-
-      const m3u8Found = [];
-      const bodyPromises = [];
-      page.on("response", (res) => {
-        const u = res.url();
-        if (u.includes(".m3u8")) {
-          console.log(`[proxy] Found HLS: ${u}`);
-          let clean = u.split("?")[0];
-          let referer = "https://videostr.net/";
-          try {
-            const qs = u.indexOf("?") >= 0 ? u.substring(u.indexOf("?") + 1) : "";
-            const params = new URLSearchParams(qs);
-            const hdr = params.get("headers");
-            if (hdr) {
-              const o = JSON.parse(decodeURIComponent(hdr));
-              if (o.referer) referer = o.referer;
-              if (o.origin) referer = o.origin;
-            }
-          } catch (e) {}
-          const idx = m3u8Found.length;
-          m3u8Found.push({ url: clean, referer, body: null });
-          bodyPromises.push(
-            res.text().then((t) => { m3u8Found[idx].body = t; }).catch(() => {})
-          );
-        }
-      });
+      page.on("response", onM3u8);
 
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
-      await new Promise((r) => setTimeout(r, 8000));
+
+      // Wait up to 20s for first m3u8, checking every 500ms
+      await Promise.race([foundPromise, new Promise((r) => setTimeout(r, 20000))]);
 
       if (m3u8Found.length > 0) {
-        await Promise.allSettled(bodyPromises);
-        const allCookies = await browser.cookies();
-        const cookieStr = allCookies.map((c) => `${c.name}=${c.value}`).join("; ");
-        console.log(`[proxy] Captured ${allCookies.length} cookies`);
+        // Wait 4s more for additional m3u8 responses (different resolutions)
+        await new Promise((r) => setTimeout(r, 4000));
+        console.log(`[proxy] Found ${m3u8Found.length} m3u8 streams`);
+
+        // Get ALL cookies via CDP
+        const cookieStr = await getAllCookies(page);
+        console.log(`[proxy] Cookies: ${cookieStr.length} chars`);
+
+        // Wait for body promises to settle
+        await new Promise((r) => setTimeout(r, 1000));
+
         for (const m of m3u8Found) {
-          console.log(`[proxy] m3u8 body: ${m.body ? m.body.length + " chars" : "null"}`);
-          results.push({ ...m, cookies: cookieStr });
+          console.log(`[proxy] Stream: ${m.url.substring(0, 50)}... body=${m.body ? m.body.length : "null"}`);
         }
-        await page.close();
+
+        // Don't close page - keep browser alive for .ts fetching
         break;
       }
 
+      // No m3u8 found on main page, try iframes
       const iframes = await page.$$eval("iframe", (els) =>
         els.map((el) => el.src).filter((s) => s && s.startsWith("http"))
       );
@@ -269,67 +322,59 @@ async function resolveStream(tmdbId) {
             if (["image", "stylesheet", "font", "media"].includes(t)) req.abort();
             else req.continue();
           });
-          const iframeM3u8 = [];
-          const iframeBodyPromises = [];
-          p2.on("response", (res) => {
-            if (res.url().includes(".m3u8")) {
-              let u = res.url();
-              let clean = u.split("?")[0];
-              let referer = "https://videostr.net/";
-              try {
-                const qs = u.indexOf("?") >= 0 ? u.substring(u.indexOf("?") + 1) : "";
-                const params = new URLSearchParams(qs);
-                const hdr = params.get("headers");
-                if (hdr) {
-                  const o = JSON.parse(decodeURIComponent(hdr));
-                  if (o.referer) referer = o.referer;
-                  if (o.origin) referer = o.origin;
-                }
-              } catch (e) {}
-              const idx = iframeM3u8.length;
-              iframeM3u8.push({ url: clean, referer, body: null });
-              iframeBodyPromises.push(
-                res.text().then((t) => { iframeM3u8[idx].body = t; }).catch(() => {})
-              );
-            }
-          });
+          p2.on("response", onM3u8);
           await p2.goto(src, { waitUntil: "domcontentloaded", timeout: 20000 });
-          await new Promise((r) => setTimeout(r, 6000));
-          if (iframeM3u8.length > 0) {
-            await Promise.allSettled(iframeBodyPromises);
-            const allCookies = await browser.cookies();
-            const cookieStr = allCookies.map((c) => `${c.name}=${c.value}`).join("; ");
-            for (const m of iframeM3u8) {
-              results.push({ ...m, cookies: cookieStr });
-            }
+          await Promise.race([foundPromise, new Promise((r) => setTimeout(r, 15000))]);
+          if (m3u8Found.length > 0) {
+            await new Promise((r) => setTimeout(r, 4000));
+            break;
           }
         } catch (e) {}
         await p2.close();
-        if (results.length > 0) break;
       }
+
+      if (m3u8Found.length > 0) break;
     } catch (e) {
       console.log(`[proxy] Error: ${e.message}`);
       if (page) try { await page.close(); } catch (e2) {}
     }
-    if (results.length > 0) break;
   }
 
-  await browser.close();
+  if (m3u8Found.length === 0) {
+    await browser.close();
+    return [];
+  }
 
-  const baseUrl = results.length ? (global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com") : "";
+  // Get cookies from last active page
+  const pages = await browser.pages();
+  const lastPage = pages[pages.length - 1];
+  const cookieStr = await getAllCookies(lastPage);
+  console.log(`[proxy] Final cookies: ${cookieStr.length} chars`);
+
+  const baseUrl = global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com";
   const streams = [];
-  for (const r of results) {
+  for (const r of m3u8Found) {
     const sessionId = createSession({
       referer: r.referer,
-      cookies: r.cookies,
+      cookies: cookieStr,
+      browser: browser,
       m3u8Bodies: r.body ? { [r.url]: r.body } : {},
     });
-    console.log(`[proxy] Session ${sessionId} for ${r.url.substring(0, 50)}...`);
+    console.log(`[proxy] Session ${sessionId} created`);
     streams.push({
       url: `${baseUrl}/hls/${encodeProxyPayload(sessionId, r.url)}.m3u8`,
       headers: {},
     });
   }
+
+  // Close browser after 10 minutes
+  setTimeout(() => {
+    if (browser.connected) {
+      console.log(`[proxy] Closing idle browser`);
+      browser.close().catch(() => {});
+    }
+  }, 10 * 60 * 1000);
+
   streams.reverse();
   return streams;
 }
