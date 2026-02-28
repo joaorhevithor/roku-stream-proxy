@@ -1,0 +1,10 @@
+{
+  "name": "roku-stream-proxy",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}

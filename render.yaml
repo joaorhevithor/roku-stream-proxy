@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: roku-stream-proxy
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
