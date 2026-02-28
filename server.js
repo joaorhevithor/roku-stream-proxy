@@ -211,8 +211,9 @@ async function resolveStream(tmdbId) {
         else req.continue();
       });
 
-      const m3u8Responses = [];
-      page.on("response", async (res) => {
+      const m3u8Found = [];
+      const bodyPromises = [];
+      page.on("response", (res) => {
         const u = res.url();
         if (u.includes(".m3u8")) {
           console.log(`[proxy] Found HLS: ${u}`);
@@ -228,23 +229,24 @@ async function resolveStream(tmdbId) {
               if (o.origin) referer = o.origin;
             }
           } catch (e) {}
-          let body = null;
-          try {
-            body = await res.text();
-          } catch (e) {
-            console.log(`[proxy] Could not read m3u8 body: ${e.message}`);
-          }
-          m3u8Responses.push({ url: clean, referer, body });
+          const idx = m3u8Found.length;
+          m3u8Found.push({ url: clean, referer, body: null });
+          bodyPromises.push(
+            res.text().then((t) => { m3u8Found[idx].body = t; }).catch(() => {})
+          );
         }
       });
 
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
       await new Promise((r) => setTimeout(r, 8000));
 
-      if (m3u8Responses.length > 0) {
+      if (m3u8Found.length > 0) {
+        await Promise.allSettled(bodyPromises);
         const allCookies = await browser.cookies();
         const cookieStr = allCookies.map((c) => `${c.name}=${c.value}`).join("; ");
-        for (const m of m3u8Responses) {
+        console.log(`[proxy] Captured ${allCookies.length} cookies`);
+        for (const m of m3u8Found) {
+          console.log(`[proxy] m3u8 body: ${m.body ? m.body.length + " chars" : "null"}`);
           results.push({ ...m, cookies: cookieStr });
         }
         await page.close();
@@ -268,7 +270,8 @@ async function resolveStream(tmdbId) {
             else req.continue();
           });
           const iframeM3u8 = [];
-          p2.on("response", async (res) => {
+          const iframeBodyPromises = [];
+          p2.on("response", (res) => {
             if (res.url().includes(".m3u8")) {
               let u = res.url();
               let clean = u.split("?")[0];
@@ -283,16 +286,17 @@ async function resolveStream(tmdbId) {
                   if (o.origin) referer = o.origin;
                 }
               } catch (e) {}
-              let body = null;
-              try {
-                body = await res.text();
-              } catch (e) {}
-              iframeM3u8.push({ url: clean, referer, body });
+              const idx = iframeM3u8.length;
+              iframeM3u8.push({ url: clean, referer, body: null });
+              iframeBodyPromises.push(
+                res.text().then((t) => { iframeM3u8[idx].body = t; }).catch(() => {})
+              );
             }
           });
           await p2.goto(src, { waitUntil: "domcontentloaded", timeout: 20000 });
           await new Promise((r) => setTimeout(r, 6000));
           if (iframeM3u8.length > 0) {
+            await Promise.allSettled(iframeBodyPromises);
             const allCookies = await browser.cookies();
             const cookieStr = allCookies.map((c) => `${c.name}=${c.value}`).join("; ");
             for (const m of iframeM3u8) {
