@@ -17,21 +17,33 @@ const SOURCES = [
   (id) => `https://moviesapi.club/movie/${id}`,
 ];
 
-function fetchWithHeaders(url, referer, origin, hostHeader) {
+function fetchWithHeaders(url, referer, origin, hostHeader, redirectCount) {
+  redirectCount = redirectCount || 0;
+  if (redirectCount > 5) return Promise.reject(new Error("Too many redirects"));
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : require("http");
     const headers = {
       Referer: referer || u.origin + "/",
       Origin: origin || referer || u.origin + "/",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "*/*",
     };
-    if (hostHeader) headers.Host = hostHeader;
-    lib.get(url, { headers }, (res) => {
+    const req = lib.get(url, { headers }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const next = new URL(res.headers.location, url).href;
+        return fetchWithHeaders(next, referer, origin, hostHeader, redirectCount + 1).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        console.log(`[hls] Fetch status ${res.statusCode} for ${url.substring(0, 60)}...`);
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => resolve({ body: Buffer.concat(chunks), contentType: res.headers["content-type"] }));
-    }).on("error", reject);
+    });
+    req.on("error", reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error("Timeout")); });
   });
 }
 
@@ -98,10 +110,12 @@ async function handleHlsProxy(req, res, pathname) {
         const proxySeg = `${proxyBase}/hls/${encodeProxyPayload(segUrl, ref, hostHeader)}.${segUrl.includes(".m3u8") ? "m3u8" : "ts"}`;
         out.push(proxySeg);
       }
+      console.log(`[hls] OK m3u8, ${out.length} lines`);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.writeHead(200);
       return res.end(out.join("\n"));
     }
+    console.log(`[hls] OK ${ext}, ${body.length} bytes`);
     res.setHeader("Content-Type", contentType || "video/mp2t");
     res.writeHead(200);
     return res.end(body);
