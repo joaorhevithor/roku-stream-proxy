@@ -44,16 +44,18 @@ async function fetchWithPuppeteer(url, referer) {
   const browser = await getHlsBrowser();
   const page = await browser.newPage();
   try {
-    const ref = referer || new URL(url).origin + "/";
-    await page.goto(ref, { waitUntil: "domcontentloaded", timeout: 12000 });
-    const result = await page.evaluate(async (u) => {
-      const r = await fetch(u);
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const ab = await r.arrayBuffer();
-      const contentType = r.headers.get("content-type") || "";
-      return { body: Array.from(new Uint8Array(ab)), contentType };
-    }, url);
-    return { body: Buffer.from(result.body), contentType: result.contentType };
+    const ref = (referer || new URL(url).origin + "/").replace(/\/?$/, "/");
+    await page.setExtraHTTPHeaders({
+      Referer: ref,
+      Origin: ref.replace(/\/$/, ""),
+    });
+    const res = await page.goto(url, { waitUntil: "load", timeout: 15000 });
+    if (!res || res.status() !== 200) {
+      throw new Error(res ? "HTTP " + res.status() : "No response");
+    }
+    const body = await res.buffer();
+    const contentType = res.headers()["content-type"] || "";
+    return { body, contentType };
   } finally {
     await page.close().catch(() => {});
   }
