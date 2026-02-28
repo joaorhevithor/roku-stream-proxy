@@ -17,18 +17,17 @@ const SOURCES = [
   (id) => `https://moviesapi.club/movie/${id}`,
 ];
 
-function fetchWithHeaders(url, referer, origin) {
+function fetchWithHeaders(url, referer, origin, hostHeader) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : require("http");
-    const opts = {
-      headers: {
-        Referer: referer || u.origin + "/",
-        Origin: origin || referer || u.origin + "/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0",
-      },
+    const headers = {
+      Referer: referer || u.origin + "/",
+      Origin: origin || referer || u.origin + "/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0",
     };
-    lib.get(url, opts, (res) => {
+    if (hostHeader) headers.Host = hostHeader;
+    lib.get(url, { headers }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => resolve({ body: Buffer.concat(chunks), contentType: res.headers["content-type"] }));
@@ -36,8 +35,10 @@ function fetchWithHeaders(url, referer, origin) {
   });
 }
 
-function encodeProxyPayload(url, referer) {
-  const payload = referer ? `${url}|${referer}` : url;
+function encodeProxyPayload(url, referer, hostHeader) {
+  let payload = url;
+  if (referer) payload += "|" + referer;
+  if (hostHeader) payload += "|" + hostHeader;
   return Buffer.from(payload).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
@@ -45,9 +46,12 @@ function decodeProxyPayload(encoded) {
   try {
     const padded = encoded.replace(/-/g, "+").replace(/_/g, "/");
     const payload = Buffer.from(padded, "base64").toString("utf8");
-    const i = payload.indexOf("|");
-    if (i >= 0) return { url: payload.substring(0, i), referer: payload.substring(i + 1) };
-    return { url: payload, referer: "" };
+    const parts = payload.split("|");
+    return {
+      url: parts[0] || "",
+      referer: parts[1] || "",
+      hostHeader: parts[2] || "",
+    };
   } catch (e) {
     return null;
   }
@@ -61,13 +65,15 @@ async function handleHlsProxy(req, res, pathname) {
   }
   const encoded = match[1];
   const ext = match[3] || "m3u8";
-  const { url, referer } = decodeProxyPayload(encoded) || {};
+  const decoded = decodeProxyPayload(encoded);
+  const { url, referer, hostHeader } = decoded || {};
   if (!url) {
     res.writeHead(400);
     return res.end("Invalid");
   }
   try {
-    const { body, contentType } = await fetchWithHeaders(url, referer, referer);
+    console.log(`[hls] Fetching ${ext}: ${url.substring(0, 80)}...`);
+    const { body, contentType } = await fetchWithHeaders(url, referer, referer, hostHeader);
     if (ext === "m3u8") {
       const baseUrl = url.includes("?") ? url.substring(0, url.indexOf("?")) : url;
       const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
@@ -89,7 +95,7 @@ async function handleHlsProxy(req, res, pathname) {
         let segUrl = line;
         if (!segUrl.startsWith("http")) segUrl = new URL(segUrl, baseDir).href;
         const ref = referer || segUrl;
-        const proxySeg = `${proxyBase}/hls/${encodeProxyPayload(segUrl, ref)}.${segUrl.includes(".m3u8") ? "m3u8" : "ts"}`;
+        const proxySeg = `${proxyBase}/hls/${encodeProxyPayload(segUrl, ref, hostHeader)}.${segUrl.includes(".m3u8") ? "m3u8" : "ts"}`;
         out.push(proxySeg);
       }
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -140,17 +146,22 @@ async function resolveStream(tmdbId) {
         const u = res.url();
         if (u.includes(".m3u8")) {
           console.log(`[proxy] Found HLS: ${u}`);
-          let clean = u.split("?headers=")[0];
+          let clean = u.split("?")[0];
           let referer = "https://videostr.net/";
+          let hostHeader = "";
           try {
-            const hdr = u.indexOf("?headers=") >= 0 && decodeURIComponent(u.substring(u.indexOf("?headers=") + 9));
+            const qs = u.indexOf("?") >= 0 ? u.substring(u.indexOf("?") + 1) : "";
+            const params = new URLSearchParams(qs);
+            const hdr = params.get("headers");
             if (hdr) {
-              const o = JSON.parse(hdr);
+              const o = JSON.parse(decodeURIComponent(hdr));
               if (o.referer) referer = o.referer;
               if (o.origin) referer = o.origin;
             }
+            const hostParam = params.get("host");
+            if (hostParam) hostHeader = hostParam.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
           } catch (e) {}
-          results.push({ url: clean, referer });
+          results.push({ url: clean, referer, hostHeader });
         }
       });
 
@@ -180,17 +191,22 @@ async function resolveStream(tmdbId) {
           p2.on("response", (res) => {
             if (res.url().includes(".m3u8")) {
               let u = res.url();
-              let clean = u.split("?headers=")[0];
+              let clean = u.split("?")[0];
               let referer = "https://videostr.net/";
+              let hostHeader = "";
               try {
-                const hdr = u.indexOf("?headers=") >= 0 && decodeURIComponent(u.substring(u.indexOf("?headers=") + 9));
+                const qs = u.indexOf("?") >= 0 ? u.substring(u.indexOf("?") + 1) : "";
+                const params = new URLSearchParams(qs);
+                const hdr = params.get("headers");
                 if (hdr) {
-                  const o = JSON.parse(hdr);
+                  const o = JSON.parse(decodeURIComponent(hdr));
                   if (o.referer) referer = o.referer;
                   if (o.origin) referer = o.origin;
                 }
+                const hostParam = params.get("host");
+                if (hostParam) hostHeader = hostParam.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
               } catch (e) {}
-              results.push({ url: clean, referer });
+              results.push({ url: clean, referer, hostHeader });
             }
           });
           await p2.goto(src, { waitUntil: "domcontentloaded", timeout: 20000 });
@@ -209,8 +225,8 @@ async function resolveStream(tmdbId) {
   await browser.close();
 
   const baseUrl = results.length ? (global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com") : "";
-  return results.map(({ url, referer }) => ({
-    url: `${baseUrl}/hls/${encodeProxyPayload(url, referer)}.m3u8`,
+  return results.map(({ url, referer, hostHeader }) => ({
+    url: `${baseUrl}/hls/${encodeProxyPayload(url, referer, hostHeader)}.m3u8`,
     headers: {},
   }));
 }
