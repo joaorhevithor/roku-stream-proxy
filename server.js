@@ -109,8 +109,22 @@ const server = http.createServer(async (req, res) => {
   try {
     const streams = await resolveStream(tmdbId);
     console.log(`[proxy] Found ${streams.length} streams`);
+    const parsed = streams.map((raw) => {
+      try {
+        const u = new URL(raw);
+        const hdr = u.searchParams.get("headers");
+        const clean = raw.split("?headers=")[0];
+        let headers = {};
+        if (hdr) {
+          try { headers = JSON.parse(decodeURIComponent(hdr)); } catch (e) {}
+        }
+        return { url: clean, headers };
+      } catch (e) {
+        return { url: raw, headers: {} };
+      }
+    });
     res.writeHead(200);
-    res.end(JSON.stringify({ streams }));
+    res.end(JSON.stringify({ streams: parsed }));
   } catch (e) {
     console.log(`[proxy] Error: ${e.message}`);
     res.writeHead(200);
