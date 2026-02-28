@@ -13,6 +13,7 @@ function getBaseUrl(req) {
 }
 
 const SOURCES = [
+  (id) => `https://vidsrc.to/embed/movie/${id}`,
   (id) => `https://vidlink.pro/movie/${id}`,
   (id) => `https://vidsrc.icu/embed/movie/${id}`,
   (id) => `https://moviesapi.club/movie/${id}`,
@@ -50,6 +51,7 @@ function createSession(data) {
 function parseM3u8Params(fullUrl) {
   let clean = fullUrl.split("?")[0];
   let referer = "https://videostr.net/";
+  let hostHeader = "";
   try {
     const qs = fullUrl.indexOf("?") >= 0 ? fullUrl.substring(fullUrl.indexOf("?") + 1) : "";
     const params = new URLSearchParams(qs);
@@ -59,8 +61,10 @@ function parseM3u8Params(fullUrl) {
       if (o.referer) referer = o.referer;
       if (o.origin) referer = o.origin;
     }
+    const hostParam = params.get("host");
+    if (hostParam) hostHeader = hostParam.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
   } catch (e) {}
-  return { clean, referer };
+  return { clean, referer, hostHeader };
 }
 
 function getVariantM3u8Urls(m3u8Body, baseUrl) {
@@ -107,7 +111,7 @@ async function getAllCookies(page) {
   }
 }
 
-function fetchWithCookies(url, referer, cookies) {
+function fetchWithCookies(url, referer, cookies, hostHeader) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : require("http");
@@ -132,10 +136,11 @@ function fetchWithCookies(url, referer, cookies) {
       },
     };
     if (cookies) options.headers.Cookie = cookies;
+    if (hostHeader) options.headers.Host = hostHeader;
     const req = lib.get(options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const next = new URL(res.headers.location, url).href;
-        return fetchWithCookies(next, referer, cookies).then(resolve).catch(reject);
+        return fetchWithCookies(next, referer, cookies, hostHeader).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
         return reject(new Error(`HTTP ${res.statusCode}`));
@@ -238,24 +243,31 @@ async function handleHlsProxy(req, res, pathname) {
     console.log(`[hls] Fetching ${ext}: ${url.substring(0, 60)}...`);
     let body, contentType;
     try {
-      const r = await fetchWithCookies(url, session.referer, session.cookies);
+      const r = await fetchWithCookies(url, session.referer, session.cookies, session.hostHeader);
       body = r.body;
       contentType = r.contentType;
       console.log(`[hls] OK via HTTP, ${body.length} bytes`);
     } catch (httpErr) {
-      console.log(`[hls] HTTP failed (${httpErr.message}), trying page fetch...`);
+      if (httpErr.message === "HTTP 403" && session.hostHeader) {
+        try {
+          const r = await fetchWithCookies(url, session.referer, session.cookies, null);
+          body = r.body;
+          contentType = r.contentType;
+          console.log(`[hls] OK via HTTP (no Host), ${body.length} bytes`);
+        } catch (e2) {}
+      }
+    }
+    if (!body) {
+      console.log(`[hls] HTTP failed, trying page fetch...`);
       if (session.videoPage && typeof session.videoPage.isClosed === "function" && !session.videoPage.isClosed()) {
         try {
           const r = await fetchViaPage(session.videoPage, url);
           body = r.body;
           contentType = r.contentType;
           console.log(`[hls] OK via page fetch, ${body.length} bytes`);
-        } catch (e) {
-          throw httpErr;
-        }
-      } else {
-        throw httpErr;
+        } catch (e) {}
       }
+      if (!body) throw new Error("HTTP 403");
     }
 
     if (ext === "m3u8") {
@@ -290,9 +302,9 @@ async function resolveStream(tmdbId) {
     const u = res.url();
     if (!u.includes(".m3u8")) return;
     console.log(`[proxy] Found HLS: ${u}`);
-    const { clean, referer } = parseM3u8Params(u);
+    const { clean, referer, hostHeader } = parseM3u8Params(u);
     const idx = m3u8Found.length;
-    m3u8Found.push({ url: clean, referer, body: null });
+    m3u8Found.push({ url: clean, referer, hostHeader, body: null });
     bodyPromises.push(
       res.buffer().then((b) => { m3u8Found[idx].body = b.toString("utf8"); }).catch((e) => { console.log(`[proxy] Body read failed: ${e.message}`); })
     );
@@ -406,34 +418,28 @@ async function resolveStream(tmdbId) {
 
   const baseUrl = global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com";
   const videoPage = lastPage;
-  const streams = [];
-  for (const r of m3u8Found) {
-    const m3u8Bodies = {};
-    if (r.body) m3u8Bodies[r.url] = r.body;
-    if (r.variantBodies) Object.assign(m3u8Bodies, r.variantBodies);
-    const sessionId = createSession({
-      referer: r.referer,
-      cookies: cookieStr,
-      videoPage: videoPage,
-      m3u8Bodies,
-    });
-    console.log(`[proxy] Session ${sessionId} created`);
-    streams.push({
-      url: `${baseUrl}/hls/${encodeProxyPayload(sessionId, r.url)}.m3u8`,
-      headers: {},
-    });
-  }
 
-  // Close browser after 10 minutes
+  const master = m3u8Found.find((m) => m.body) || m3u8Found[0];
+  if (!master) return [];
+
+  const m3u8Bodies = {};
+  if (master.body) m3u8Bodies[master.url] = master.body;
+  if (master.variantBodies) Object.assign(m3u8Bodies, master.variantBodies);
+
+  const sessionId = createSession({
+    referer: master.referer,
+    cookies: cookieStr,
+    hostHeader: master.hostHeader || "",
+    videoPage: videoPage,
+    m3u8Bodies,
+  });
+  console.log(`[proxy] Session ${sessionId} created (1 stream)`);
+
   setTimeout(() => {
-    if (browser.connected) {
-      console.log(`[proxy] Closing idle browser`);
-      browser.close().catch(() => {});
-    }
-  }, 10 * 60 * 1000);
+    if (browser.connected) browser.close().catch(() => {});
+  }, 15 * 60 * 1000);
 
-  streams.reverse();
-  return streams;
+  return [{ url: `${baseUrl}/hls/${encodeProxyPayload(sessionId, master.url)}.m3u8`, headers: {} }];
 }
 
 const server = http.createServer(async (req, res) => {
