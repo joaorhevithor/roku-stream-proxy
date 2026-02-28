@@ -4,10 +4,9 @@ const puppeteer = require("puppeteer");
 const PORT = process.env.PORT || 8888;
 
 const SOURCES = [
-  (id) => `https://vidsrc.cc/v2/embed/movie/${id}`,
+  (id) => `https://vidlink.pro/movie/${id}`,
   (id) => `https://vidsrc.icu/embed/movie/${id}`,
   (id) => `https://moviesapi.club/movie/${id}`,
-  (id) => `https://vidlink.pro/movie/${id}`,
 ];
 
 async function resolveStream(tmdbId) {
@@ -18,7 +17,11 @@ async function resolveStream(tmdbId) {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--single-process",
+      "--disable-software-rasterizer",
+      "--no-zygote",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--js-flags=--max-old-space-size=256",
     ],
   });
 
@@ -27,8 +30,18 @@ async function resolveStream(tmdbId) {
   for (const buildUrl of SOURCES) {
     const url = buildUrl(tmdbId);
     console.log(`[proxy] Trying: ${url}`);
-    const page = await browser.newPage();
+    let page;
     try {
+      page = await browser.newPage();
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        const t = req.resourceType();
+        if (["image", "stylesheet", "font", "media"].includes(t)) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
       page.on("response", (res) => {
         const u = res.url();
         if (u.includes(".m3u8")) {
@@ -37,48 +50,61 @@ async function resolveStream(tmdbId) {
         }
       });
 
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 20000 });
-      await new Promise((r) => setTimeout(r, 5000));
-
-      if (hlsUrls.size > 0) {
-        await page.close();
-        break;
-      }
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+      await new Promise((r) => setTimeout(r, 8000));
+      if (hlsUrls.size > 0) { await page.close(); break; }
 
       const iframes = await page.$$eval("iframe", (els) =>
         els.map((el) => el.src).filter((s) => s && s.startsWith("http"))
       );
-      for (const iframeSrc of iframes.slice(0, 3)) {
-        console.log(`[proxy] Following iframe: ${iframeSrc}`);
-        const ipage = await browser.newPage();
+      await page.close();
+      page = null;
+
+      for (const src of iframes.slice(0, 2)) {
+        console.log(`[proxy] Iframe: ${src}`);
+        const p2 = await browser.newPage();
         try {
-          ipage.on("response", (res) => {
-            const u = res.url();
-            if (u.includes(".m3u8")) {
-              console.log(`[proxy] Found HLS in iframe: ${u}`);
-              hlsUrls.add(u);
+          await p2.setRequestInterception(true);
+          p2.on("request", (req) => {
+            const t = req.resourceType();
+            if (["image", "stylesheet", "font", "media"].includes(t)) {
+              req.abort();
+            } else {
+              req.continue();
             }
           });
-          await ipage.goto(iframeSrc, {
-            waitUntil: "networkidle2",
-            timeout: 15000,
+          p2.on("response", (res) => {
+            if (res.url().includes(".m3u8")) {
+              console.log(`[proxy] HLS in iframe: ${res.url()}`);
+              hlsUrls.add(res.url());
+            }
           });
-          await new Promise((r) => setTimeout(r, 3000));
-        } catch (e) {
-          /* ignore */
-        }
-        await ipage.close();
+          await p2.goto(src, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await new Promise((r) => setTimeout(r, 6000));
+        } catch (e) {}
+        await p2.close();
         if (hlsUrls.size > 0) break;
       }
     } catch (e) {
       console.log(`[proxy] Error: ${e.message}`);
+      if (page) try { await page.close(); } catch (e2) {}
     }
-    await page.close();
     if (hlsUrls.size > 0) break;
   }
 
   await browser.close();
-  return [...hlsUrls];
+
+  return [...hlsUrls].map((raw) => {
+    const idx = raw.indexOf("?headers=");
+    if (idx === -1) return { url: raw, headers: {} };
+    const clean = raw.substring(0, idx);
+    try {
+      const hdr = JSON.parse(decodeURIComponent(raw.substring(idx + 9)));
+      return { url: clean, headers: hdr };
+    } catch (e) {
+      return { url: clean, headers: {} };
+    }
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -86,52 +112,30 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
-
   if (url.pathname === "/health") {
     res.writeHead(200);
-    res.end(JSON.stringify({ status: "ok" }));
-    return;
+    return res.end(JSON.stringify({ status: "ok" }));
   }
 
   const tmdbId = url.searchParams.get("id");
   if (!tmdbId) {
     res.writeHead(200);
-    res.end(
-      JSON.stringify({
-        status: "proxy running",
-        usage: "/stream?id=TMDB_ID",
-      })
-    );
-    return;
+    return res.end(JSON.stringify({ status: "running", usage: "/stream?id=TMDB_ID" }));
   }
 
   console.log(`\n[proxy] Resolving TMDB ID: ${tmdbId}`);
   try {
     const streams = await resolveStream(tmdbId);
-    console.log(`[proxy] Found ${streams.length} streams`);
-    const parsed = streams.map((raw) => {
-      try {
-        const u = new URL(raw);
-        const hdr = u.searchParams.get("headers");
-        const clean = raw.split("?headers=")[0];
-        let headers = {};
-        if (hdr) {
-          try { headers = JSON.parse(decodeURIComponent(hdr)); } catch (e) {}
-        }
-        return { url: clean, headers };
-      } catch (e) {
-        return { url: raw, headers: {} };
-      }
-    });
+    console.log(`[proxy] Result: ${streams.length} streams`);
     res.writeHead(200);
-    res.end(JSON.stringify({ streams: parsed }));
+    res.end(JSON.stringify({ streams }));
   } catch (e) {
-    console.log(`[proxy] Error: ${e.message}`);
+    console.log(`[proxy] Fatal: ${e.message}`);
     res.writeHead(200);
-    res.end(JSON.stringify({ error: e.message, streams: [] }));
+    res.end(JSON.stringify({ streams: [] }));
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Roku Stream Proxy running on port ${PORT}`);
+  console.log(`Roku Stream Proxy on port ${PORT}`);
 });
