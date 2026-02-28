@@ -17,25 +17,78 @@ const SOURCES = [
   (id) => `https://moviesapi.club/movie/${id}`,
 ];
 
+const PUPPETEER_LAUNCH_OPTIONS = {
+  headless: "new",
+  args: [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--no-zygote",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--js-flags=--max-old-space-size=256",
+  ],
+};
+
+let hlsBrowser = null;
+async function getHlsBrowser() {
+  if (hlsBrowser && hlsBrowser.connected) return hlsBrowser;
+  if (hlsBrowser) try { await hlsBrowser.close(); } catch (e) {}
+  hlsBrowser = await puppeteer.launch(PUPPETEER_LAUNCH_OPTIONS);
+  return hlsBrowser;
+}
+
+async function fetchWithPuppeteer(url, referer) {
+  const browser = await getHlsBrowser();
+  const page = await browser.newPage();
+  try {
+    const ref = referer || new URL(url).origin + "/";
+    await page.goto(ref, { waitUntil: "domcontentloaded", timeout: 12000 });
+    const result = await page.evaluate(async (u) => {
+      const r = await fetch(u);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const ab = await r.arrayBuffer();
+      const contentType = r.headers.get("content-type") || "";
+      return { body: Array.from(new Uint8Array(ab)), contentType };
+    }, url);
+    return { body: Buffer.from(result.body), contentType: result.contentType };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
 function fetchWithHeaders(url, referer, origin, hostHeader, redirectCount) {
   redirectCount = redirectCount || 0;
   if (redirectCount > 5) return Promise.reject(new Error("Too many redirects"));
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : require("http");
-    const headers = {
-      Referer: referer || u.origin + "/",
-      Origin: origin || referer || u.origin + "/",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "*/*",
+    const pathRaw = u.pathname.replace(/%2F/gi, "/") + (u.search || "");
+    const options = {
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: pathRaw,
+      method: "GET",
+      headers: {
+        Referer: referer || u.origin + "/",
+        Origin: origin || referer || u.origin + "/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "*/*",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+      },
     };
-    const req = lib.get(url, { headers }, (res) => {
+    if (hostHeader) options.headers.Host = hostHeader;
+    const req = lib.get(options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const next = new URL(res.headers.location, url).href;
         return fetchWithHeaders(next, referer, origin, hostHeader, redirectCount + 1).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
-        console.log(`[hls] Fetch status ${res.statusCode} for ${url.substring(0, 60)}...`);
+        console.log(`[hls] Fetch status ${res.statusCode} for ${u.origin}${pathRaw.substring(0, 50)}...`);
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
       const chunks = [];
@@ -78,14 +131,17 @@ async function handleHlsProxy(req, res, pathname) {
   const encoded = match[1];
   const ext = match[3] || "m3u8";
   const decoded = decodeProxyPayload(encoded);
-  const { url, referer, hostHeader } = decoded || {};
+  let { url, referer, hostHeader } = decoded || {};
   if (!url) {
     res.writeHead(400);
     return res.end("Invalid");
   }
+  url = url.replace(/%2F/g, "/");
   try {
-    console.log(`[hls] Fetching ${ext}: ${url.substring(0, 80)}...`);
-    const { body, contentType } = await fetchWithHeaders(url, referer, referer, hostHeader);
+    console.log(`[hls] Fetching ${ext} via Puppeteer: ${url.substring(0, 60)}...`);
+    const r = await fetchWithPuppeteer(url, referer);
+    const body = r.body;
+    const contentType = r.contentType;
     if (ext === "m3u8") {
       const baseUrl = url.includes("?") ? url.substring(0, url.indexOf("?")) : url;
       const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
@@ -127,20 +183,7 @@ async function handleHlsProxy(req, res, pathname) {
 }
 
 async function resolveStream(tmdbId) {
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-software-rasterizer",
-      "--no-zygote",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--js-flags=--max-old-space-size=256",
-    ],
-  });
+  const browser = await puppeteer.launch(PUPPETEER_LAUNCH_OPTIONS);
 
   const results = [];
 
@@ -239,10 +282,12 @@ async function resolveStream(tmdbId) {
   await browser.close();
 
   const baseUrl = results.length ? (global.__hlsBaseUrl || "https://roku-stream-proxy.onrender.com") : "";
-  return results.map(({ url, referer, hostHeader }) => ({
+  const list = results.map(({ url, referer, hostHeader }) => ({
     url: `${baseUrl}/hls/${encodeProxyPayload(url, referer, hostHeader)}.m3u8`,
     headers: {},
   }));
+  list.reverse();
+  return list;
 }
 
 const server = http.createServer(async (req, res) => {
